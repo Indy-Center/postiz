@@ -1,0 +1,123 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.event.repository.name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # Nothing to build: the VPS runs Postiz's published image. The job name matches the other VPS apps.
+  build-and-deploy:
+    needs: ci # skipped if any check fails
+    runs-on: ubuntu-latest
+    env:
+      # The app's directory on the VPS: /home/deploy/apps/<repo name>/.
+      APP: ${{ github.event.repository.name }}
+      URL: https://social.flyindycenter.com
+    steps:
+      - uses: actions/checkout@v4
+
+      # VANDERBILT_HOST and VANDERBILT_DEPLOY_USER are organization variables, the key and known_hosts are organization
+      # secrets; all four are limited to selected repositories.
+      # An org admin adds this repository to each of them before the first deploy.
+      - name: Set up SSH
+        env:
+          VANDERBILT_HOST: ${{ vars.VANDERBILT_HOST }}
+          VANDERBILT_DEPLOY_USER: ${{ vars.VANDERBILT_DEPLOY_USER }}
+          VANDERBILT_DEPLOY_SSH_KEY: ${{ secrets.VANDERBILT_DEPLOY_SSH_KEY }}
+          VANDERBILT_KNOWN_HOSTS: ${{ secrets.VANDERBILT_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VANDERBILT_DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$VANDERBILT_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host vps
+            HostName $VANDERBILT_HOST
+            User $VANDERBILT_DEPLOY_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+          EOF
+
+      # --delete removes files dropped from deploy/; excluded files (.env) are never deleted.
+      - name: Sync deploy/ to ~/apps/<app>/
+        run: rsync -rlz --delete --exclude=.env --exclude=.env.example deploy/ "vps:apps/$APP/"
+
+      # Writes ~/apps/<app>/.env from the ENV_* settings listed below: ENV_<NAME> becomes NAME='value'.
+      # The deploy owns that file and rewrites it every time, so a value changes by updating its secret
+      # or variable and re-running the deploy, never by editing the file on the box.
+      - name: Write .env
+        env:
+          # One line per setting in deploy/.env.example. secrets.* for real secrets, vars.* for the rest.
+          # Listed by name rather than passing toJSON(secrets): the step only sees what the app needs, and
+          # GitHub flags workflows that hand every secret to a step that talks to another host.
+          ENV_JWT_SECRET: ${{ secrets.ENV_JWT_SECRET }}
+          ENV_POSTGRES_PASSWORD: ${{ secrets.ENV_POSTGRES_PASSWORD }}
+          ENV_DISABLE_REGISTRATION: ${{ vars.ENV_DISABLE_REGISTRATION }}
+          ENV_DISCORD_CLIENT_ID: ${{ secrets.ENV_DISCORD_CLIENT_ID }}
+          ENV_DISCORD_CLIENT_SECRET: ${{ secrets.ENV_DISCORD_CLIENT_SECRET }}
+          ENV_DISCORD_BOT_TOKEN_ID: ${{ secrets.ENV_DISCORD_BOT_TOKEN_ID }}
+          ENV_YOUTUBE_CLIENT_ID: ${{ secrets.ENV_YOUTUBE_CLIENT_ID }}
+          ENV_YOUTUBE_CLIENT_SECRET: ${{ secrets.ENV_YOUTUBE_CLIENT_SECRET }}
+          ENV_FACEBOOK_APP_ID: ${{ secrets.ENV_FACEBOOK_APP_ID }}
+          ENV_FACEBOOK_APP_SECRET: ${{ secrets.ENV_FACEBOOK_APP_SECRET }}
+        run: |
+          # Values are single-quoted so Compose takes them literally, $ and # included. So a value can't
+          # contain a single quote or a newline; if one does, this fails before anything reaches the box.
+          # Unset settings arrive empty and are left out, so the app's own defaults apply.
+          filter=$(cat <<'JQ'
+          env | to_entries | sort_by(.key)[]
+          | select(.key | startswith("ENV_"))
+          | select(.value != "")
+          | if (.value | test("['\n]"))
+            then error("\(.key) contains a single quote or a newline")
+            else "\(.key | ltrimstr("ENV_"))='\(.value)'"
+            end
+          JQ
+          )
+          env_file="$(jq -rn "$filter")"
+          printf '%s\n' "$env_file" | ssh vps "umask 077 && cat > apps/$APP/.env"
+
+      # up -d waits for Temporal's default namespace before starting Postiz, which can take a minute on
+      # the first deploy while Temporal creates its schema.
+      - name: docker compose up -d
+        run: |
+          ssh vps "APP=$APP bash -s" <<'EOF'
+          set -e
+          cd ~/apps/"$APP"
+          # The stack idles at about 2.2 GB. Before it first starts, make sure the box has that to spare
+          # rather than squeezing the other apps. Once it's running, its memory is already accounted for.
+          if [ -z "$(docker compose ps -q app)" ]; then
+            available=$(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo)
+            echo "Memory available: ${available} MB"
+            if [ "$available" -lt 2600 ]; then
+              echo "Postiz needs about 2.6 GB free to start safely; not starting it."
+              exit 1
+            fi
+          fi
+          docker compose pull --quiet
+          docker compose up -d --remove-orphans
+          sleep 15
+          docker compose ps
+          # Healthy = nothing restarting and no restarts since start. One-shot containers that exited 0 pass.
+          if docker inspect -f '{{.State.Restarting}} {{.RestartCount}}' $(docker compose ps -aq) | grep -qv '^false 0$'; then
+            docker compose logs --tail 50
+            exit 1
+          fi
+          EOF
+
+      # The backend answers only after it has reached Postgres and Temporal. This request goes through Traefik.
+      - name: App answers
+        run: curl -fsS --retry 12 --retry-delay 10 --retry-all-errors "$URL/api/monitor/queue/deploy"

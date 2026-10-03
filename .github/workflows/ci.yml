@@ -1,0 +1,59 @@
+name: CI
+
+# No push trigger: on main, CI runs inside build-and-deploy.yml, so it still runs once per commit.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # Throwaway values for the runner. The real ones are the repo's ENV_* secrets.
+      JWT_SECRET: ci-only-not-a-secret
+      POSTGRES_PASSWORD: postiz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose file is valid
+        run: docker compose -f deploy/docker-compose.yml config -q
+
+      # Fails on a mistyped image or tag before it reaches the VPS.
+      - name: Images exist
+        run: docker compose -f deploy/docker-compose.yml pull --quiet
+
+      # Uses the VPS layout: the compose project runs from a directory named after the repo, next to
+      # an external traefik-shared network. up -d waits for Temporal's namespace before starting Postiz.
+      - name: Stack starts and stays up
+        run: |
+          docker network create traefik-shared
+          cd deploy
+          docker compose up -d
+          sleep 15
+          docker compose ps
+          # Healthy = nothing restarting and no restarts since start.
+          if docker inspect -f '{{.State.Restarting}} {{.RestartCount}}' $(docker compose ps -aq) | grep -qv '^false 0$'; then
+            docker compose logs --tail 50
+            exit 1
+          fi
+
+      # The backend only answers once it has pushed its schema to Postgres and registered its search
+      # attributes in Temporal, so an answer through Caddy on 5000 proves all three.
+      - name: App answers
+        run: |
+          cd deploy
+          for i in $(seq 1 30); do
+            if docker compose exec -T app node -e "
+              fetch('http://127.0.0.1:5000/api/monitor/queue/ci')
+                .then((res) => process.exit(res.ok ? 0 : 1))
+                .catch(() => process.exit(1));
+            "; then
+              exit 0
+            fi
+            sleep 10
+          done
+          docker compose logs --tail 100
+          exit 1

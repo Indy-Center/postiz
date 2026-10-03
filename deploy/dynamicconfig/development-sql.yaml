@@ -1,0 +1,11 @@
+# Temporal's dynamic config, copied from Postiz's dynamicconfig/development-sql.yaml at the pinned version.
+# Postiz sends workflow ids longer than Temporal's default limit allows.
+limit.maxIDLength:
+  - value: 255
+    constraints: {}
+# Upstream marks this dev-only. It makes the search attributes Postiz registers at startup usable straight
+# away instead of after Temporal's cache refresh; the cost is an extra read per search, which doesn't matter
+# at this volume.
+system.forceSearchAttributesCacheRefreshOnRead:
+  - value: true
+    constraints: {}

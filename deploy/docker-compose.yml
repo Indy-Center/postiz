@@ -1,0 +1,161 @@
+# Postiz, deployed to /home/deploy/apps/postiz/ on the Vanderbilt VPS. build-and-deploy.yml rsyncs
+# deploy/ there, so the compose project is named after the repo.
+# Renaming the repo renames the project and its volumes; the old volumes stay behind.
+#
+# Adapted from Postiz's own docker-compose.yaml at the pinned version, minus the parts a production box
+# doesn't need: Elasticsearch (Temporal keeps its visibility data in Postgres instead), the Temporal UI
+# and admin tools, Sentry Spotlight, and every published port.
+services:
+  app:
+    # Pinned rather than :latest: Postiz has made breaking infrastructure changes between minor versions
+    # (Temporal became required in v2.12.0). Read the release notes before bumping it.
+    image: ghcr.io/gitroomhq/postiz-app:v2.25.0
+    restart: unless-stopped
+    # Idles at about 1.9 GB (backend, orchestrator, frontend and their pm2 wrappers). The limit keeps a leak
+    # from taking memory from the other apps on the box.
+    mem_limit: 3g
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Postiz registers its search attributes in Temporal's default namespace at startup and exits if
+      # it can't, so it waits for the namespace, not just the port.
+      temporal:
+        condition: service_healthy
+    # .env is written on the VPS by the deploy from the repo's ENV_* secrets and variables; it's never in git.
+    # deploy/.env.example lists the names. It holds the secrets and the social channels' app credentials.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MAIN_URL: https://social.flyindycenter.com
+      FRONTEND_URL: https://social.flyindycenter.com
+      NEXT_PUBLIC_BACKEND_URL: https://social.flyindycenter.com/api
+      # The frontend's server reaches the backend inside the same container.
+      BACKEND_INTERNAL_URL: http://localhost:3000
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (repo secret ENV_JWT_SECRET)}
+      DATABASE_URL: postgresql://postiz:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (repo secret ENV_POSTGRES_PASSWORD)}@db:5432/postiz
+      REDIS_URL: redis://redis:6379
+      TEMPORAL_ADDRESS: temporal:7233
+      IS_GENERAL: 'true'
+      # After the first account exists, nobody can sign up with a password. See "Accounts" in the README.
+      DISABLE_REGISTRATION: ${DISABLE_REGISTRATION:-true}
+      STORAGE_PROVIDER: local
+      UPLOAD_DIRECTORY: /uploads
+      NEXT_PUBLIC_UPLOAD_DIRECTORY: /uploads
+      NX_ADD_PLUGINS: 'false'
+    volumes:
+      # Named volumes: the deploy rsyncs with --delete, so they can't live under deploy/.
+      - uploads:/uploads
+      - config:/config
+    networks:
+      - traefik-shared # reachable by Traefik
+      - internal # reaches the database, Redis and Temporal
+    labels:
+      - traefik.enable=true
+      # Router names are global across every app on the box; prefix them with the app's name.
+      - traefik.http.routers.postiz.rule=Host(`social.flyindycenter.com`)
+      - traefik.http.routers.postiz.entrypoints=websecure
+      - traefik.http.routers.postiz.tls=true
+      # nginx inside the image serves the frontend, /api and /uploads on 5000.
+      - traefik.http.services.postiz.loadbalancer.server.port=5000
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+  # Postiz's database, and Temporal's: Temporal creates its own temporal and temporal_visibility databases
+  # in this server on first start.
+  # On the app's own network only, never traefik-shared, and no ports on the host.
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postiz
+      POSTGRES_DB: postiz
+      # Only read when the volume is first created. Changing it later doesn't change the database's password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (repo secret ENV_POSTGRES_PASSWORD)}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postiz -d postiz']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+  # Runs Postiz's scheduled posts. The auto-setup image creates its schema and the default namespace on
+  # first start. Pinned to the version Postiz's own compose file uses.
+  temporal:
+    image: temporalio/auto-setup:1.28.1
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_SEEDS: db
+      POSTGRES_USER: postiz
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (repo secret ENV_POSTGRES_PASSWORD)}
+      # Visibility (workflow search) in Postgres rather than Elasticsearch.
+      ENABLE_ES: 'false'
+      # Postgres visibility allows only 3 custom Text search attributes. auto-setup's sample attributes would
+      # take them all, and Postiz's backend then can't register organizationId and postId and never serves.
+      SKIP_ADD_CUSTOM_SEARCH_ATTRIBUTES: 'true'
+      DEFAULT_NAMESPACE: default
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    volumes:
+      # Config, not data, so a bind mount from deploy/ is fine: it's replaced on every deploy.
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    healthcheck:
+      # Healthy once the default namespace exists, which auto-setup creates after the server is up.
+      test: ['CMD-SHELL', 'temporal operator namespace describe --namespace default --address "$$(hostname -i):7233"']
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+networks:
+  traefik-shared:
+    external: true
+  internal:
+
+volumes:
+  db-data:
+  redis-data:
+  uploads:
+  config:
