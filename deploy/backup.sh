@@ -15,6 +15,9 @@
 # Encrypting, uploading and pruning are the runner's job, not this script's.
 #
 #   bash backup.sh <empty folder>
+
+# The single-quoted commands below are expanded inside the containers, not here.
+# shellcheck disable=SC2016
 set -euo pipefail
 # The archive holds password hashes and the channels' tokens: only its owner may read it.
 umask 077
@@ -27,44 +30,46 @@ out="$(cd "$out" && pwd)"
 # Run from this script's folder, so `docker compose` finds this app's compose file.
 cd "$(dirname "$0")"
 
-# Runs inside the running db container, which has pg_dump, psql and tar, so the host needs only
-# Docker. It reads the uploads as a tar on stdin, and writes the finished archive to stdout;
-# messages go to stderr.
-archive_in_db=$(
-  cat << 'SH'
-set -eu
-# A private working folder inside the container, removed however this ends.
-dir="$(mktemp -d)"
-trap 'rm -rf "$dir"' EXIT
-mkdir "$dir/databases"
-
-# postiz first, then Temporal's: a post made in between then has a workflow but no post, which
-# fails harmlessly when it runs, rather than a post with no workflow, which never publishes.
-dbs=$(psql -X -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres -c "
-  SELECT datname FROM pg_database
-  WHERE NOT datistemplate AND datname <> 'postgres'
-  ORDER BY datname <> '$POSTGRES_DB', datname")
-for db in $dbs; do
-  pg_dump -U "$POSTGRES_USER" -d "$db" --format=custom --file="$dir/databases/$db.dump"
-done
-[ -f "$dir/databases/$POSTGRES_DB.dump" ] || { echo "no $POSTGRES_DB database to dump" >&2; exit 1; }
-
-# The uploads, after the dumps, so every file the postiz database names is in the archive.
-cat > "$dir/uploads.tar"
-tar -tf "$dir/uploads.tar" > /dev/null
-
-# The dumps are already compressed, and the uploads are mostly images, so the archive isn't.
-tar -C "$dir" -cf - databases uploads.tar
-SH
-)
+# The archive is put together inside the running db container, which has pg_dump, psql and tar,
+# so the host needs only Docker. Commands run there by in_db get its working folder as $WORK.
+work=/tmp/backup
+in_db() { docker compose exec -T -e WORK="$work" db "$@"; }
 
 # Write to a temporary name and rename once complete, so a failure never leaves a partial archive
-# where the runner would take it for a backup, even when the runner stops this script.
-trap 'rm -f "$out/postiz.tar.partial"' EXIT
+# where the runner would take it for a backup, even when the runner stops this script. The
+# working folder in the db container goes too, however this ends.
+trap 'rm -f "$out/postiz.tar.partial"; in_db rm -rf "$work" < /dev/null || true' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
+failed() { echo "backup.sh: $1 failed" >&2; exit 1; }
+
+# 1. The databases. postiz first, then Temporal's: a post made in between then has a workflow but
+#    no post, which fails harmlessly when it runs, rather than a post with no workflow, which never
+#    publishes.
+in_db sh -c '
+  set -eu
+  rm -rf "$WORK"
+  mkdir -p "$WORK/databases"
+  dbs=$(psql -X -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres -c "
+    SELECT datname FROM pg_database
+    WHERE NOT datistemplate AND datname <> '\''postgres'\''
+    ORDER BY datname <> '\''$POSTGRES_DB'\'', datname")
+  for db in $dbs; do
+    pg_dump -U "$POSTGRES_USER" -d "$db" --format=custom --file="$WORK/databases/$db.dump"
+  done
+  [ -f "$WORK/databases/$POSTGRES_DB.dump" ] || { echo "no $POSTGRES_DB database to dump" >&2; exit 1; }
+' < /dev/null || failed "dumping the databases"
+
+# 2. The uploads, from the running app, only once the dumps are done, so every file the postiz
+#    database names is in the archive. Then the archive goes out on stdout. The dumps are already
+#    compressed, and the uploads are mostly images, so it isn't.
 docker compose exec -T app tar -C /uploads -cf - . < /dev/null \
-  | docker compose exec -T db sh -c "$archive_in_db" > "$out/postiz.tar.partial" \
-  || { echo "backup.sh: the backup failed" >&2; exit 1; }
+  | in_db sh -c '
+      set -eu
+      cat > "$WORK/uploads.tar"
+      tar -tf "$WORK/uploads.tar" > /dev/null
+      tar -C "$WORK" -cf - databases uploads.tar
+    ' > "$out/postiz.tar.partial" \
+  || failed "copying the uploads"
 mv "$out/postiz.tar.partial" "$out/postiz.tar"
 echo "backup.sh: wrote $out/postiz.tar ($(du -h "$out/postiz.tar" | cut -f1))"
