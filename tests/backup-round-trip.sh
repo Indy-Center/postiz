@@ -109,7 +109,8 @@ wait_for_app
 
 echo "--- Give it data: an account, an uploaded image, a channel and a post scheduled on it"
 auth=$(api POST /api/auth/register \
-  "{\"email\":\"$email\",\"password\":\"$password\",\"company\":\"Round trip\",\"provider\":\"LOCAL\"}")
+  "{\"email\":\"$email\",\"password\":\"$password\",\"company\":\"Round trip\",\"provider\":\"LOCAL\"}") \
+  || fail "signing up failed"
 [ -n "$auth" ] || fail "signing up gave no auth cookie"
 image_path=$(upload "$auth" | jq -r .path)
 image_path=/${image_path#*://*/}
@@ -155,11 +156,17 @@ backup=${files[0]}
 config=$(docker compose exec -T app ls -A /config < /dev/null)
 [ -z "$config" ] || fail "Postiz now keeps files in /config, which backup.sh doesn't back up: $config"
 
-echo "--- A file that isn't a backup is refused, and Postiz keeps running"
-echo "not a backup" > "$work/bad.tar"
-if bash restore.sh "$work/bad.tar"; then fail "restore.sh accepted a file that isn't a backup"; fi
-[ -n "$(docker compose ps -q --status running app)" ] || fail "a refused restore stopped Postiz"
-[ ! -e restore-failed ] || fail "a refused restore left the restore-failed marker"
+echo "--- A file that isn't a backup, or a backup without Postiz's database, is refused"
+echo "not a backup" > "$work/not-a-backup.tar"
+mkdir "$work/partial"
+tar -xf "$backup" -C "$work/partial"
+rm "$work/partial/databases/postiz.dump"
+tar -cf "$work/no-postiz-database.tar" -C "$work/partial" .
+for bad in not-a-backup no-postiz-database; do
+  if bash restore.sh "$work/$bad.tar"; then fail "restore.sh accepted $bad.tar"; fi
+  [ -n "$(docker compose ps -q --status running app)" ] || fail "refusing $bad.tar stopped Postiz"
+  [ ! -e restore-failed ] || fail "refusing $bad.tar left the restore-failed marker"
+done
 api POST /api/auth/login "{\"email\":\"$email\",\"password\":\"$password\",\"provider\":\"LOCAL\"}" > /dev/null \
   || fail "a refused restore changed the database"
 

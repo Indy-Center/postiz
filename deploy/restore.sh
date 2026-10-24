@@ -7,7 +7,7 @@
 #
 # It replaces every database in the backup (postiz, temporal, temporal_visibility) and the uploads
 # volume with the backup's: anything changed since that backup is lost. Postiz, Temporal and Redis
-# are stopped while it runs. Redis keeps no data Postiz can't refill, so it is left as it is.
+# are stopped while it runs. Redis's data isn't in the backup and isn't touched: Postiz refills it.
 
 # The single-quoted commands below are expanded inside the containers, not here.
 # shellcheck disable=SC2016
@@ -40,7 +40,8 @@ in_db sh -c 'rm -rf "$RESTORE_DIR" && mkdir "$RESTORE_DIR" && tar -x -C "$RESTOR
 in_db sh -c '
   set -eu
   cd "$RESTORE_DIR"
-  [ -f "databases/$POSTGRES_DB.dump" ] && [ -f uploads.tar ]
+  [ -f "databases/$POSTGRES_DB.dump" ]
+  [ -f uploads.tar ]
   for dump in databases/*.dump; do pg_restore --list "$dump" > /dev/null; done
   tar -tf uploads.tar > /dev/null
 ' < /dev/null || unreadable
