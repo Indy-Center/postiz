@@ -1,4 +1,4 @@
-# Postiz, deployed to /home/deploy/apps/postiz/ on the Vanderbilt VPS. build-and-deploy.yml rsyncs
+# Postiz, deployed to /home/deploy/apps/postiz/ on ALEXANDRIA. build-and-deploy.yml rsyncs
 # deploy/ there, so the compose project is named after the repo.
 # Renaming the repo renames the project and its volumes; the old volumes stay behind.
 #
@@ -48,6 +48,8 @@ services:
     volumes:
       # Named volumes: the deploy rsyncs with --delete, so they can't live under deploy/.
       - uploads:/uploads
+      # Postiz's own compose file mounts it, but v2.25.0 writes nothing there, so backup.sh leaves
+      # it out. The round trip test fails if that changes.
       - config:/config
     networks:
       - traefik-shared # reachable by Traefik
