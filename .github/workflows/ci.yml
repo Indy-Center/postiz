@@ -15,6 +15,8 @@ jobs:
       # Throwaway values for the runner. The real ones are the repo's ENV_* secrets.
       JWT_SECRET: ci-only-not-a-secret
       POSTGRES_PASSWORD: postiz
+      # The project name the VPS gives it, from the app's folder. The round trip test uses it too.
+      COMPOSE_PROJECT_NAME: postiz
     steps:
       - uses: actions/checkout@v4
 
@@ -25,8 +27,8 @@ jobs:
       - name: Images exist
         run: docker compose -f deploy/docker-compose.yml pull --quiet
 
-      # Uses the VPS layout: the compose project runs from a directory named after the repo, next to
-      # an external traefik-shared network. up -d waits for Temporal's namespace before starting Postiz.
+      # Uses the VPS layout: the compose project is named after the repo, next to an external
+      # traefik-shared network. up -d waits for Temporal's namespace before starting Postiz.
       - name: Stack starts and stays up
         run: |
           docker network create traefik-shared
@@ -57,3 +59,9 @@ jobs:
           done
           docker compose logs --tail 100
           exit 1
+
+      # deploy/backup.sh and restore.sh, as the backup runner uses them: add an account, an image and
+      # a scheduled post, back up, wipe the volumes, restore, and check they're back. Last, since it
+      # throws the data away.
+      - name: Backup and restore round trip
+        run: bash tests/backup-round-trip.sh

@@ -2,6 +2,12 @@
 .env
 .env*.local
 
+# Backups fetched for a restore (deploy/backup.sh writes postiz.tar)
+*.tar
+*.age
+# Left by a failed restore (deploy/restore.sh); it stops the deploy
+/deploy/restore-failed
+
 # misc
 .DS_Store
 
